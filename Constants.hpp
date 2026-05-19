@@ -7,10 +7,10 @@ namespace Config
 {
     constexpr std::string_view DefaultInputFile = "input.txt";
     constexpr std::string_view DefaultOutputFile = "result.txt";
-    // Фаллбэк количества потоков если hardware_concurrency() вернет 0
+    // Р¤РѕР»Р±СЌРє С‡РёСЃР»Р° РїРѕС‚РѕРєРѕРІ, РµСЃР»Рё hardware_concurrency() РІРµСЂРЅСѓР» 0
     constexpr unsigned int DefaultThreadCount = 4;
-    // Макс размер буфера
+    // РњР°РєСЃРёРјР°Р»СЊРЅР°СЏ РґР»РёРЅР° СЃР»РѕРІР° (СЃРёРјРІРѕР»РѕРІ)
     constexpr size_t MaxWordLength = 255;
-    // Размер буфера под слово: MaxWordLength + 1 (запас под '\0', хотя длину храним отдельно)
+    // Р‘СѓС„РµСЂ РїРѕРґ СЃР»РѕРІРѕ: MaxWordLength + 1 (Р·Р°РїР°СЃ РїРѕРґ '\0')
     constexpr size_t WordBufferSize = MaxWordLength + 1;
 }

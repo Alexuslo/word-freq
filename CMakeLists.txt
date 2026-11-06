@@ -1,32 +1,52 @@
-cmake_minimum_required(VERSION 3.10)
-project(WordFreqTask)
+cmake_minimum_required(VERSION 3.13)
+project(WordFreqTask LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# Максимальная оптимизация для Release сборки
-set(CMAKE_CXX_FLAGS_RELEASE "-O3")
-if(MSVC)
-    set(CMAKE_CXX_FLAGS_RELEASE "/O2 /Oi /GL")
-    set(CMAKE_EXE_LINKER_FLAGS_RELEASE "/LTCG")
+# ТЗ не требует Linux/macOS: маппинг файла — Win32 CreateFileMapping.
+if(NOT WIN32)
+    message(FATAL_ERROR "WordFreqTask targets Windows (Win32 memory-mapped files).")
 endif()
 
-add_executable(word_freq 
-    main.cpp 
-    WordFreqApp.cpp 
+add_executable(word_freq
+    main.cpp
+    WordFreqApp.cpp
     WordFreqApp.hpp
-    ChunkProcessor.cpp 
+    ChunkProcessor.cpp
     ChunkProcessor.hpp
     Constants.hpp
-    GlobalSignals.hpp
     Signal.hpp
     sha256.hpp
 )
 
-# Устанавливаем наш проект в качестве стартового (по умолчанию) в Visual Studio, 
-# чтобы избежать запуска ALL_BUILD при нажатии F5
+target_compile_features(word_freq PRIVATE cxx_std_17)
+
+# Не подменять CMAKE_CXX_FLAGS_RELEASE целиком: иначе теряется /DNDEBUG.
+if(MSVC)
+    target_compile_options(word_freq PRIVATE
+        $<$<CONFIG:Release>:/O2>
+        $<$<CONFIG:Release>:/Oi>
+        $<$<CONFIG:Release>:/GL>
+    )
+    target_link_options(word_freq PRIVATE
+        $<$<CONFIG:Release>:/LTCG>
+    )
+endif()
+
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT word_freq)
 
-# При запуске из Visual Studio (по F5) устанавливаем рабочую директорию на папку с исходниками,
-# чтобы программа видела дефолтный файл input.txt
-set_target_properties(word_freq PROPERTIES VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+set_target_properties(word_freq PROPERTIES
+    VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(word_freq_tests
+        tests/word_freq_tests.cpp
+        ChunkProcessor.cpp
+        ChunkProcessor.hpp
+        Constants.hpp
+        sha256.hpp
+    )
+    target_include_directories(word_freq_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(word_freq_tests PRIVATE cxx_std_17)
+    add_test(NAME word_freq_tests COMMAND word_freq_tests)
+endif()

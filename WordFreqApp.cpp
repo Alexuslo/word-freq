@@ -1,35 +1,90 @@
 #include "WordFreqApp.hpp"
 #include "ChunkProcessor.hpp"
 #include "Constants.hpp"
-#include "GlobalSignals.hpp"
 
-#include <iostream>
-#include <vector>
-#include <string>
-#include <unordered_map>
-#include <thread>
-#include <future>
-#include <fstream>
-#include <cstring>
 #include <algorithm>
 #include <cstdint>
+#include <exception>
+#include <fstream>
+#include <future>
+#include <iostream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
+
+namespace
+{
+unsigned char Cp1251SortKey(unsigned char Ch)
+{
+    // ё (0xB8) должен идти после е (0xE5) и перед ж (0xE6).
+    return Ch == 0xB8 ? 0xE5 : Ch;
+}
+
+bool Cp1251Less(const std::string& A, const std::string& B)
+{
+    const size_t Common = std::min(A.size(), B.size());
+    for (size_t i = 0; i < Common; ++i)
+    {
+        const unsigned char La = Cp1251SortKey(static_cast<unsigned char>(A[i]));
+        const unsigned char Lb = Cp1251SortKey(static_cast<unsigned char>(B[i]));
+        if (La != Lb)
+        {
+            return La < Lb;
+        }
+        if (A[i] != B[i])
+        {
+            return static_cast<unsigned char>(A[i]) < static_cast<unsigned char>(B[i]);
+        }
+    }
+    return A.size() < B.size();
+}
+}
+
+WordFreqApp::~WordFreqApp()
+{
+    ReleaseMapping();
+}
+
+void WordFreqApp::ReleaseMapping()
+{
+    if (m_Data)
+    {
+        UnmapViewOfFile(m_Data);
+        m_Data = nullptr;
+    }
+
+    if (m_HMap)
+    {
+        CloseHandle(m_HMap);
+        m_HMap = nullptr;
+    }
+
+    if (m_HFile)
+    {
+        CloseHandle(m_HFile);
+        m_HFile = nullptr;
+    }
+}
 
 int WordFreqApp::Init(int argc, char* argv[])
 {
-    // Парсинг аргументов командной строки.
-    // Если файлы не переданы, используются дефолтные значения из Constants.hpp.
     if (argc >= 3)
     {
         m_InputPath = argv[1];
         m_OutputPath = argv[2];
-    } 
+    }
     else if (argc == 2)
     {
         m_InputPath = argv[1];
         m_OutputPath = Config::DefaultOutputFile;
         std::cout << "Output file not specified. Using default: " << m_OutputPath << "\n";
-    } 
+    }
     else
     {
         m_InputPath = Config::DefaultInputFile;
@@ -37,11 +92,6 @@ int WordFreqApp::Init(int argc, char* argv[])
         std::cout << "Arguments not specified. Using defaults: " << m_InputPath << " -> " << m_OutputPath << "\n";
     }
 
-    // memory mapped file
-    // Для максимальной производительности чтения файла используется механизм memory mapped files.
-    // Вместо чтения файла кусками (через read() или ifstream) файл проецируется напрямую в виртуальную память.
-    // Это избавляет от двойного копирования (ядро ОС -> буфер приложения) и позволяет обращаться к 
-    // данным как к обычному массиву (m_data). Сама ОС берет на себя ленивую подгрузку страниц (Page Faults).
     HANDLE HFile = CreateFileA(m_InputPath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (HFile == INVALID_HANDLE_VALUE)
     {
@@ -56,7 +106,11 @@ int WordFreqApp::Init(int argc, char* argv[])
         std::cerr << "Failed to get file size.\n";
         return 1;
     }
-    m_FileSize = li.QuadPart;
+    m_FileSize = static_cast<size_t>(li.QuadPart);
+    if (m_FileSize == 0)
+    {
+        return 0;
+    }
 
     HANDLE HMap = CreateFileMappingA(HFile, NULL, PAGE_READONLY, 0, 0, NULL);
     if (!HMap)
@@ -78,96 +132,119 @@ int WordFreqApp::Init(int argc, char* argv[])
 
 int WordFreqApp::Run()
 {
-    if (!m_Data || m_FileSize == 0)
+    if (m_FileSize == 0)
     {
-        std::cerr << "File is empty or not loaded.\n";
+        std::ofstream OutFile(m_OutputPath);
+        if (!OutFile.is_open())
+        {
+            std::cerr << "Failed to open output file for writing.\n";
+            return 1;
+        }
         return 0;
     }
 
-    // Определяем количество логических потоков (включая HT)
+    if (!m_Data)
+    {
+        std::cerr << "File is not loaded.\n";
+        return 1;
+    }
+
     unsigned int NumThreads = std::thread::hardware_concurrency();
-    if (NumThreads == 0) NumThreads = Config::DefaultThreadCount;
-    
+    if (NumThreads == 0)
+    {
+        NumThreads = Config::DefaultThreadCount;
+    }
+
     std::cout << "Using " << NumThreads << " threads for processing." << std::endl;
 
+    m_OnChunkCompleted.DisconnectAll();
     m_ReadyIndices.clear();
+    m_ReadyIndices.reserve(NumThreads);
 
-    // Главный поток (Мейн) передает воркерам "инструкцию" (лямбду),
-    // которая будет вызвана в конце работы рабочего потока.
-    // Лямбда выполняет только быструю потокобезопасную передачу индекса потока в "почтовый ящик".
-    AppEvents::OnChunkCompleted.Connect([this](int index) {
+    m_OnChunkCompleted.Connect([this](int index) {
         std::lock_guard<std::mutex> lock(m_QueueMutex);
         m_ReadyIndices.push_back(index);
-        m_CV.notify_one(); // Будим мейн
+        m_CV.notify_one();
     });
 
-    std::vector<std::future<std::unordered_map<std::string, uint64_t>>> Futures;
-    size_t ChunkSize = m_FileSize / NumThreads;
-
     const char* const DataPtr = m_Data;
-    size_t FileSize = m_FileSize;
+    const size_t FileSize = m_FileSize;
+    const size_t ChunkSize = FileSize / NumThreads;
 
-    // Запускаем пулл рабочих потоков
-    for (unsigned int i = 0; i < NumThreads; ++i) {
-        size_t start = i * ChunkSize;
-        size_t end = (i == NumThreads - 1) ? FileSize : start + ChunkSize;
+    // Per-worker slots. Each worker writes only its own index; main reads an index
+    // only after that worker's Emit, which happens after the write.
+    std::vector<std::unordered_map<std::string, uint64_t>> ChunkResults(NumThreads);
+    std::vector<std::exception_ptr> ChunkErrors(NumThreads);
+    std::vector<std::future<void>> Futures;
 
-        Futures.push_back(std::async(std::launch::async, [DataPtr, FileSize, start, end, i]() {
-            // Воркер делает свою тяжелую математическую работу (парсинг и хэширование)
-            auto LocalMap = ChunkProcessor::Process(DataPtr, FileSize, start, end);
-            
-            // Воркер обращается к глобальной шине событий
-            AppEvents::OnChunkCompleted.Emit(i);
-            
-            return LocalMap;
-        }));
+    for (unsigned int i = 0; i < NumThreads; ++i)
+    {
+        const size_t start = static_cast<size_t>(i) * ChunkSize;
+        const size_t end = (i == NumThreads - 1) ? FileSize : start + ChunkSize;
+
+        Futures.push_back(std::async(std::launch::async,
+            [this, DataPtr, FileSize, start, end, i, &ChunkResults, &ChunkErrors]() {
+                try
+                {
+                    ChunkResults[i] = ChunkProcessor::Process(DataPtr, FileSize, start, end);
+                }
+                catch (...)
+                {
+                    ChunkErrors[i] = std::current_exception();
+                }
+                try
+                {
+                    m_OnChunkCompleted.Emit(static_cast<int>(i));
+                }
+                catch (...)
+                {
+                    std::lock_guard<std::mutex> Lock(m_QueueMutex);
+                    m_ReadyIndices.push_back(static_cast<int>(i));
+                    m_CV.notify_one();
+                }
+            }));
     }
 
     std::unordered_map<std::string, uint64_t> CommonMap;
     unsigned int ProcessedCount = 0;
 
-    // Мы не блокируемся жестко на futures[0].get() (Head-of-Line Blocking).
-    // Вместо этого мы спим и просыпаемся, когда ЛЮБОЙ рабочий поток готов отдать данные.
     while (ProcessedCount < NumThreads)
     {
         std::vector<int> ReadyNow;
         {
             std::unique_lock<std::mutex> Lock(m_QueueMutex);
-            // Если очередь пуста, полностью засыпаем (освобождаем процессор) и отпускаем мьютекс.
-            // Просыпаемся только по notify_one() из лямбды-воркера.
             m_CV.wait(Lock, [this] { return !m_ReadyIndices.empty(); });
-            
-            // Чтобы не держать мьютекс во время долгого мержа и не блокировать другие воркеры,
-            // мы мгновенно копируем (перемещаем) все индексы из "почтового ящика" себе в локальный блокнот.
             ReadyNow = std::move(m_ReadyIndices);
             m_ReadyIndices.clear();
         }
 
-        // Фаза Reduce (Слияние данных)
-        // Выполняется БЕЗ мьютексов, параллельно с фазой Map (парсингом других чанков).
         for (int i : ReadyNow)
         {
-            auto LocalMap = Futures[i].get(); // Получаем данные (это мгновенно, т.к. поток уже вызвал Emit)
-            for (const auto& [word, count] : LocalMap)
+            if (ChunkErrors[static_cast<size_t>(i)])
             {
-                CommonMap[word] += count; // Суммируем частоты одинаковых слов
+                m_OnChunkCompleted.DisconnectAll();
+                std::rethrow_exception(ChunkErrors[static_cast<size_t>(i)]);
+            }
+
+            for (const auto& [word, count] : ChunkResults[static_cast<size_t>(i)])
+            {
+                CommonMap[word] += count;
             }
             ProcessedCount++;
         }
     }
 
-    // Перекладываем данные из хеш-таблицы (где порядок не гарантирован) в вектор.
+    m_OnChunkCompleted.DisconnectAll();
+
     std::vector<std::pair<std::string, uint64_t>> SortedWords(CommonMap.begin(), CommonMap.end());
     std::sort(SortedWords.begin(), SortedWords.end(), [](const auto& a, const auto& b) {
         if (a.second != b.second)
         {
-            return a.second > b.second; // По убыванию частоты
+            return a.second > b.second;
         }
-
-        return a.first < b.first; // При равной частоте сортируем по алфавиту (для стабильного вывода)
+        return Cp1251Less(a.first, b.first);
     });
 
-    // Запись результата в файл
     std::ofstream OutFile(m_OutputPath);
     if (!OutFile.is_open())
     {
@@ -182,25 +259,4 @@ int WordFreqApp::Run()
 
     std::cout << "Processing completed successfully.\n";
     return 0;
-}
-
-void WordFreqApp::Release()
-{
-    if (m_Data)
-    {
-        UnmapViewOfFile(m_Data);
-        m_Data = nullptr;
-    }
-
-    if (m_HMap)
-    {
-        CloseHandle(m_HMap);
-        m_HMap = nullptr;
-    }
-
-    if (m_HFile)
-    {
-        CloseHandle(m_HFile);
-        m_HFile = nullptr;
-    }
 }

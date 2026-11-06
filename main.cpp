@@ -1,14 +1,30 @@
 #include "WordFreqApp.hpp"
 
+#include <exception>
+#include <iostream>
+
 int main(int Argc, char* Argv[])
 {
-    auto& Application = WordFreqApp::Get();
+    WordFreqApp Application;
 
     int ReturnCode = Application.Init(Argc, Argv);
-    if (ReturnCode != 0) return ReturnCode;
+    if (ReturnCode != 0)
+    {
+        return ReturnCode;
+    }
 
-    ReturnCode = Application.Run();
-
-    Application.Release();
-    return ReturnCode;
+    try
+    {
+        return Application.Run();
+    }
+    catch (const std::exception& Ex)
+    {
+        std::cerr << Ex.what() << "\n";
+        return 1;
+    }
+    catch (...)
+    {
+        std::cerr << "Worker failed.\n";
+        return 1;
+    }
 }

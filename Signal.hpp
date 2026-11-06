@@ -1,36 +1,37 @@
 #pragma once
 
 #include <functional>
-#include <vector>
 #include <mutex>
+#include <vector>
 
-// Шаблонный класс Signal реализует потокобезопасный паттерн Observer (Наблюдатель).
-// Он позволяет ослабить связность (Loose Coupling) между отправителем события (Worker)
-// и получателем события (Main/App).
-// Worker'у не нужно знать, кто и как обрабатывает его завершение. Он просто вызывает Emit().
+// Thread-safe Observer. Emit copies the slot list, then runs callbacks without
+// holding the internal mutex so a slot may take other locks (e.g. the ready-queue).
 template<typename... Args>
 class Signal
 {
 public:
     using SlotType = std::function<void(Args...)>;
 
-    // Метод для подписки на сигнал.
-    // Принимает лямбду или функцию и сохраняет её в список.
-    // Вызывается в контексте главного потока (при инициализации).
-    void Connect(SlotType Slot) 
+    void Connect(SlotType Slot)
     {
         std::lock_guard<std::mutex> Lock(m_Mutex);
         m_Slots.push_back(std::move(Slot));
     }
 
-    // Метод для рассылки сигнала.
-    // Вызывается в контексте рабочего потока (Worker'а).
-    // Поочередно выполняет все сохраненные лямбды-подписчики НА СТОРОНЕ (и ресурсах)
-    // того потока, который вызвал Emit().
-    void Emit(Args... args)
+    void DisconnectAll()
     {
         std::lock_guard<std::mutex> Lock(m_Mutex);
-        for (auto& Slot : m_Slots)
+        m_Slots.clear();
+    }
+
+    void Emit(Args... args)
+    {
+        std::vector<SlotType> Slots;
+        {
+            std::lock_guard<std::mutex> Lock(m_Mutex);
+            Slots = m_Slots;
+        }
+        for (auto& Slot : Slots)
         {
             Slot(args...);
         }

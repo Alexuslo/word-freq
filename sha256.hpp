@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#include <cstring>
 
 // Simple, Header-only SHA-256 implementation 
 // Based on Brad Conte's public domain implementation
@@ -77,16 +78,39 @@ inline void sha256_init(SHA256_CTX *ctx)
 
 inline void sha256_update(SHA256_CTX *ctx, const uint8_t data[], size_t len)
 {
-    for (size_t i = 0; i < len; ++i)
+    if (len == 0)
     {
-        ctx->data[ctx->datalen] = data[i];
-        ctx->datalen++;
+        return;
+    }
+
+    if (ctx->datalen > 0)
+    {
+        const size_t Need = 64 - ctx->datalen;
+        const size_t Take = len < Need ? len : Need;
+        std::memcpy(ctx->data + ctx->datalen, data, Take);
+        ctx->datalen += static_cast<uint32_t>(Take);
+        data += Take;
+        len -= Take;
         if (ctx->datalen == 64)
         {
             sha256_transform(ctx, ctx->data);
             ctx->bitlen += 512;
             ctx->datalen = 0;
         }
+    }
+
+    while (len >= 64)
+    {
+        sha256_transform(ctx, data);
+        ctx->bitlen += 512;
+        data += 64;
+        len -= 64;
+    }
+
+    if (len > 0)
+    {
+        std::memcpy(ctx->data, data, len);
+        ctx->datalen = static_cast<uint32_t>(len);
     }
 }
 
